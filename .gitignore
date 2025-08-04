@@ -1,0 +1,16 @@
+/build/
+/*.bin
+/sdkconfig
+/sdkconfig.old
+/.vscode/
+/*.elf
+*.map
+*.pyc
+__pycache__/
+/.DS_Store
+*.bak
+*.swp
+.idea/
+*.log
+*.tmp
+
