@@ -2,8 +2,8 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 
-#define PIN_R0   GPIO_NUM_4
-#define PIN_G0   GPIO_NUM_2
+#define PIN_R0   GPIO_NUM_2
+#define PIN_G0   GPIO_NUM_4
 #define PIN_B0   GPIO_NUM_5
 #define PIN_R1   GPIO_NUM_18
 #define PIN_G1   GPIO_NUM_19
@@ -17,7 +17,7 @@
 
 
 #define WIDTH        40     // columns per row
-#define ROW_HOLD_US  300    // microseconds per row
+#define ROW_HOLD_US  800    // microseconds per row
 
 // Initialize GPIOs as outputs, set safe defaults
 static void init_pins(void) {
@@ -29,32 +29,21 @@ static void init_pins(void) {
     gpio_config_t io = { .pin_bit_mask = mask, .mode = GPIO_MODE_OUTPUT };
     gpio_config(&io);
 
-    gpio_set_level(PIN_CLK, 0);
-    gpio_set_level(PIN_LE,  0);
-    gpio_set_level(PIN_OE,  1);  // outputs off
-    gpio_set_level(PIN_A,   0);
-    gpio_set_level(PIN_B,   0);
-    gpio_set_level(PIN_C,   0);
-    gpio_set_level(PIN_R0,  0);
-    gpio_set_level(PIN_G0,  0);
-    gpio_set_level(PIN_B0,  0);
-	gpio_set_level(PIN_R1,  0);
-    gpio_set_level(PIN_G1,  0);
-    gpio_set_level(PIN_B1,  0);
+
 }
 
 static inline void pulse_clk(void) {
     gpio_set_level(PIN_CLK, 1);
-    __asm__ __volatile__("nop\nnop");  // small settle
+    //__asm__ __volatile__("nop\nnop");  // small settle
     gpio_set_level(PIN_CLK, 0);
 }
 
 // Perform LE=3CLK latch sequence
 static void latch_3clk(void) {
-    gpio_set_level(PIN_OE, 1);  // blank
+    //gpio_set_level(PIN_OE, 1);  // blank
     gpio_set_level(PIN_LE, 1);
     for (int i = 0; i < 3; ++i) {
-        __asm__ __volatile__("nop\nnop");
+        //__asm__ __volatile__("nop\nnop");
         pulse_clk();
     }
     gpio_set_level(PIN_LE, 0);
@@ -62,39 +51,76 @@ static void latch_3clk(void) {
 
 // Shift one row’s bits: only col 0 is “on” for row 0
 static void shift_row_bits(int row) {
-    for (int col = 0; col < WIDTH; ++col) {
-        bool bit_on = (row == 0 && col == 0);
+	
+    for (int col = 0; col < 80; col++) {
+        
+
+
+
+	//bool bit_on = (row == 0 && (col >= 3 && col <= 77));
+
+
+	bool bit_on  = col >= 0 && col <= 77;
+
+
+
+		
         gpio_set_level(PIN_R0, bit_on);
         gpio_set_level(PIN_G0, bit_on);
         gpio_set_level(PIN_B0, bit_on);
+        gpio_set_level(PIN_R1, bit_on);
+        gpio_set_level(PIN_G1, bit_on);
+        gpio_set_level(PIN_B1, bit_on);
         pulse_clk();
     }
 }
 
 void app_main(void) {
     init_pins();
-
+	esp_rom_delay_us(ROW_HOLD_US*3);
     while (true) {
-        for (int row = 0; row < 8; ++row) {
-            
-			esp_rom_delay_us(ROW_HOLD_US);
-			shift_row_bits(row);
-esp_rom_delay_us(ROW_HOLD_US);
-            latch_3clk();
-esp_rom_delay_us(ROW_HOLD_US);
+        for (int row = 0; row < 5; row++) {  
+
+
+		            gpio_set_level(PIN_OE, 1);
+
 
             // set row address
             gpio_set_level(PIN_A, (row >> 0) & 1);
             gpio_set_level(PIN_B, (row >> 1) & 1);
             gpio_set_level(PIN_C, (row >> 2) & 1);
-esp_rom_delay_us(ROW_HOLD_US);
+
+
+        
+			
+			shift_row_bits(row);
+
+
+            latch_3clk();
+
+
 
             // unblank, hold then blank
             gpio_set_level(PIN_OE, 0);
             esp_rom_delay_us(ROW_HOLD_US);
-            gpio_set_level(PIN_OE, 1);
+
         }
     }
 }
 
 
+
+
+/*
+
+int bit_on = 0;
+		if (row == 4 && (col >= 3 && col <= 78))
+		{
+			bit_on = 1;		
+		}
+		else {
+			bit_on = 0;
+		}
+
+
+*/
