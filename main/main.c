@@ -1,3 +1,469 @@
+// main.c
+// HUB75 driver - Mode 1 (1/5 scan per half), 6-bit per color cached bitplanes
+// Optimized: replaces panel_map table with get_panel_map_coord_fast (IRAM, always_inline)
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_rom_sys.h"
+#include "soc/gpio_struct.h"
+#include "esp_attr.h"    // for IRAM_ATTR
+#include <stdbool.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include <stdio.h>
+
+/* -------------------- PIN DEFINITIONS -------------------- */
+#define PIN_R0   GPIO_NUM_2
+#define PIN_G0   GPIO_NUM_4
+#define PIN_B0   GPIO_NUM_5
+#define PIN_R1   GPIO_NUM_18
+#define PIN_G1   GPIO_NUM_19
+#define PIN_B1   GPIO_NUM_25
+#define PIN_CLK  GPIO_NUM_13
+#define PIN_LE   GPIO_NUM_12
+#define PIN_OE   GPIO_NUM_14
+#define PIN_A    GPIO_NUM_15
+#define PIN_B    GPIO_NUM_26
+#define PIN_C    GPIO_NUM_23
+
+/* How many panels are flattened horizontally in the final destination row.
+   For a vertical stack of 3 panels (1×3), set NUM_HORIZONTAL_PANELS = 3. */
+#define NUM_HORIZONTAL_PANELS 3
+
+#define COLUMNS (80 * NUM_HORIZONTAL_PANELS)
+#define SCAN     5
+#define PANEL_W (40 * NUM_HORIZONTAL_PANELS)  // destination width (flattened)
+#define PANEL_H 20
+#define BIT_DEPTH 6
+#define BITPLANES BIT_DEPTH
+
+/* ----------------------------
+   Precompute / config struct
+   ---------------------------- */
+typedef struct {
+    int panel_w;
+    int panel_h;
+    int N;      // horizontal panels in source grid
+    int M;      // vertical panels in source grid
+
+    // fixed-point reciprocal helpers
+    uint32_t recip_pw;   // round( (1<<SHIFT) / panel_w )
+    uint32_t recip_ph;   // round( (1<<SHIFT) / panel_h )
+    uint32_t SHIFT;      // number of fractional bits used
+
+    // derived sizes
+    int total_src_w;     // panel_w * N
+    int total_src_h;     // panel_h * M
+} PanelMapFast;
+
+static PanelMapFast pm; // global panel mapper
+
+/* ----------------------------
+   Initialize precomputed constants
+   Call once at startup after you know panel_w/panel_h/N/M
+   ---------------------------- */
+// Tuning: 24 gives 24 bits fractional precision (≈16M scale). Good balance on ESP32.
+static inline void map_src_to_flat_row_init(PanelMapFast *pm,int panel_w,int panel_h,int N,int M){
+    if(!pm) return;
+    pm->panel_w = panel_w;
+    pm->panel_h = panel_h;
+    pm->N = N;
+    pm->M = M;
+    pm->total_src_w = panel_w * N;
+    pm->total_src_h = panel_h * M;
+
+    pm->SHIFT = 24u;
+    // Rounded reciprocal to reduce boundary errors:
+    pm->recip_pw = (((uint64_t)1 << pm->SHIFT) + (uint64_t)panel_w/2) / (uint64_t)panel_w;
+    pm->recip_ph = (((uint64_t)1 << pm->SHIFT) + (uint64_t)panel_h/2) / (uint64_t)panel_h;
+}
+
+static inline void map_src_to_flat_row_fast(const PanelMapFast *pm,int x,int y,int *dx,int *dy){
+    // assume x,y already in [0..total_src_* - 1]
+    // compute panel indices using multiply+shift (faster than divide)
+    uint32_t panel_x = (uint32_t)((((uint64_t)x * pm->recip_pw) >> pm->SHIFT));
+    uint32_t panel_y = (uint32_t)((((uint64_t)y * pm->recip_ph) >> pm->SHIFT));
+
+    // safety clamp in case x==total_src_w (or rounding nudges it)
+    if (panel_x >= (uint32_t)pm->N) panel_x = pm->N - 1;
+    if (panel_y >= (uint32_t)pm->M) panel_y = pm->M - 1;
+
+    int local_x = x - (int)panel_x * pm->panel_w;
+    int local_y = y - (int)panel_y * pm->panel_h;
+    uint32_t panel_index = panel_y * pm->N + panel_x;
+
+    *dx = local_x + (int)panel_index * pm->panel_w;
+    *dy = local_y;
+}
+
+
+/* ----------------------------
+   Convenience wrapper that clamps and calls hot path
+   (this one has branches; safe to use from non-ISR or when you want safe mapping)
+   ---------------------------- */
+static inline void map_src_to_flat_row_clamped(const PanelMapFast *pm,
+                                               int x, int y,
+                                               int *dx, int *dy)
+{
+    if (!pm) { *dx = 0; *dy = 0; return; }
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= pm->total_src_w) x = pm->total_src_w - 1;
+    if (y >= pm->total_src_h) y = pm->total_src_h - 1;
+    map_src_to_flat_row_fast(pm, x, y, dx, dy);
+}
+
+/* -------------------- simple legacy helper (kept for reference) -------------------- */
+static inline void map_src_to_dst(int x, int y, int *dx, int *dy) {
+    *dx = x + 40 * (y / 20);
+    *dy = y % 20;
+}
+
+/* -------------------- PANEL COORD MAPPER (unchanged) -------------------- */
+typedef struct { uint8_t x; uint8_t y; } PixelMap;
+
+static inline __attribute__((always_inline)) IRAM_ATTR PixelMap get_panel_map_coord_fast(int i,int j){
+    // i is row within a 20-row panel (0..19)
+    static const uint8_t y_lut[5] = {0,1,2,3,4};
+    int row = i % 10;                 // convert into 0..9 within the 10-row half
+    int idx = row % 5;                // 0..4 index into y_lut
+    uint8_t y = y_lut[idx];
+
+    unsigned G = j >> 2;
+    unsigned r = j & 3u;
+    unsigned H = G >> 1;
+    unsigned t = G & 1u;
+    unsigned base16 = H << 4;
+    unsigned top_x = base16 + t * 12u;
+    unsigned bottom_x = base16 + (t << 2) + 4u;
+
+    unsigned bottom = (i % 10 >= 5) ? 1u : 0u; // depends on row inside the 10-row half
+    unsigned x = (bottom ? (bottom_x + r) : (top_x + r));
+
+    PixelMap p; p.x = x; p.y = y;
+    return p;
+}
+
+
+
+
+/* -------------------- FRAMEBUFFER (linear 0..255) -------------------- */
+typedef struct { uint8_t r,g,b; } Pixel;
+static Pixel frame[PANEL_H][PANEL_W];
+
+/* -------------------- CACHED BITPLANES -------------------- */
+static uint8_t bitplane[BITPLANES][SCAN][COLUMNS];
+
+/* -------------------- OPTIMIZED UNITS -------------------- */
+static const uint32_t optimized_plane_units[BITPLANES] = {1, 2, 4, 8, 12, 18};
+
+/* per-channel plane times in units (uint32) */
+static uint32_t plane_time_R[BITPLANES];
+static uint32_t plane_time_G[BITPLANES];
+static uint32_t plane_time_B[BITPLANES];
+
+/* -------------------- PER-CHANNEL PWM SCALE (user-tunable) ------------ */
+static float pwm_R_scale = 0.6f;
+static float pwm_G_scale = 0.5f;
+static float pwm_B_scale = 200.0f; // user-provided value (extreme example)
+
+/* base multiplier: how many microseconds per unit */
+static uint32_t base_unit_us = 1; // user provided value
+
+/* -------------------- GAINS & BRIGHTNESS -------------------- */
+static float R_gain = 0.6f;
+static float G_gain = 0.5f;
+static float B_gain = 50.0f;
+static uint8_t global_brightness = 255; // 0..255
+
+/* -------------------- 256-value gamma table (gamma = 2.2) --------------- */
+static const uint8_t gamma8[256] = {
+    /* same table as before (kept for brevity) */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,
+    1,1,1,1,2,2,2,2,3,3,3,4,4,4,5,5,
+    6,6,7,7,8,9,9,10,11,11,12,13,14,15,16,17,
+    18,19,20,21,22,23,24,25,27,28,29,31,32,33,35,36,
+    38,39,41,42,44,46,47,49,51,53,54,56,58,60,62,64,
+    66,68,70,72,74,76,78,81,83,85,87,90,92,94,97,99,
+    101,104,106,109,111,114,116,119,121,124,127,129,132,135,137,140,
+    143,146,149,151,154,157,160,163,166,169,172,175,178,181,184,188,
+    191,194,197,201,204,207,211,214,218,221,224,228,231,235,239,242,
+    246,249,253,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255
+};
+
+/* -------------------- PIN MASKS & REGISTER HELPERS -------------------- */
+#define BITPIN(pin) (1U << (pin))
+static const uint32_t MASK_R0 = BITPIN(PIN_R0);
+static const uint32_t MASK_G0 = BITPIN(PIN_G0);
+static const uint32_t MASK_B0 = BITPIN(PIN_B0);
+static const uint32_t MASK_R1 = BITPIN(PIN_R1);
+static const uint32_t MASK_G1 = BITPIN(PIN_G1);
+static const uint32_t MASK_B1 = BITPIN(PIN_B1);
+static const uint32_t MASK_RGB =
+    BITPIN(PIN_R0)|BITPIN(PIN_G0)|BITPIN(PIN_B0)|
+    BITPIN(PIN_R1)|BITPIN(PIN_G1)|BITPIN(PIN_B1);
+static const uint32_t MASK_CLK = BITPIN(PIN_CLK);
+static const uint32_t MASK_LE  = BITPIN(PIN_LE);
+static const uint32_t MASK_OE  = BITPIN(PIN_OE);
+static const uint32_t MASK_A   = BITPIN(PIN_A);
+static const uint32_t MASK_B   = BITPIN(PIN_B);
+static const uint32_t MASK_C   = BITPIN(PIN_C);
+
+static inline void gpio_out_set_levels(uint8_t patt)
+{
+    uint32_t out = 0;
+    if (patt & 0x01) out |= MASK_R0;
+    if (patt & 0x02) out |= MASK_G0;
+    if (patt & 0x04) out |= MASK_B0;
+    if (patt & 0x08) out |= MASK_R1;
+    if (patt & 0x10) out |= MASK_G1;
+    if (patt & 0x20) out |= MASK_B1;
+    GPIO.out_w1tc = MASK_RGB;
+    GPIO.out_w1ts = out;
+}
+static inline void pulse_clk(void) { GPIO.out_w1ts = MASK_CLK; GPIO.out_w1tc = MASK_CLK; }
+static inline void set_pin(uint32_t mask, bool v) { if (v) GPIO.out_w1ts = mask; else GPIO.out_w1tc = mask; }
+
+/* -------------------- PIN INIT -------------------- */
+static void init_pins(void)
+{
+    uint64_t mask =
+        (1ULL<<PIN_R0)|(1ULL<<PIN_G0)|(1ULL<<PIN_B0)|
+        (1ULL<<PIN_R1)|(1ULL<<PIN_G1)|(1ULL<<PIN_B1)|
+        (1ULL<<PIN_CLK)|(1ULL<<PIN_LE)|(1ULL<<PIN_OE)|
+        (1ULL<<PIN_A)|(1ULL<<PIN_B)|(1ULL<<PIN_C);
+
+    gpio_config_t io = {
+        .pin_bit_mask = mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io);
+
+    GPIO.out_w1tc = mask;      // clear all outputs
+    GPIO.out_w1ts = MASK_OE;   // OE high = outputs disabled
+}
+
+/* -------------------- COMPUTE PER-PLANE TIMES (uses optimized units) -------------------- */
+static void compute_plane_times(void)
+{
+    for (int i = 0; i < BITPLANES; ++i) {
+        uint32_t base_unit = optimized_plane_units[i]; // unit counts
+        plane_time_R[i] = (uint32_t)( (float)base_unit * pwm_R_scale ); // units
+        plane_time_G[i] = (uint32_t)( (float)base_unit * pwm_G_scale );
+        plane_time_B[i] = (uint32_t)( (float)base_unit * pwm_B_scale );
+    }
+}
+
+/* -------------------- UPDATE CACHED BITPLANES FOR A SINGLE PIXEL -------------------- */
+static void update_pixel_bitplanes(int sx, int sy)
+{
+    if ((unsigned)sx >= PANEL_W || (unsigned)sy >= PANEL_H) return;
+
+    bool lower_half = (sy < 10);
+    PixelMap p = lower_half ? get_panel_map_coord_fast(sy, sx) : get_panel_map_coord_fast(sy - 10, sx);
+    if (p.y >= SCAN) return;
+    int row = p.y;
+    int col = p.x;
+
+    Pixel src = frame[sy][sx];
+
+    // apply gains & global brightness, clamp
+    int r_scaled = (int)((float)src.r * R_gain * ((float)global_brightness / 255.0f) + 0.5f);
+    int g_scaled = (int)((float)src.g * G_gain * ((float)global_brightness / 255.0f) + 0.5f);
+    int b_scaled = (int)((float)src.b * B_gain * ((float)global_brightness / 255.0f) + 0.5f);
+
+    if (r_scaled < 0) r_scaled = 0; else if (r_scaled > 255) r_scaled = 255;
+    if (g_scaled < 0) g_scaled = 0; else if (g_scaled > 255) g_scaled = 255;
+    if (b_scaled < 0) b_scaled = 0; else if (b_scaled > 255) b_scaled = 255;
+
+    // gamma (lookup)
+    uint8_t Rc = gamma8[r_scaled];
+    uint8_t Gc = gamma8[g_scaled];
+    uint8_t Bc = gamma8[b_scaled];
+
+    // map 0..255 -> 0..63 (6-bit)
+    uint8_t R6 = (uint8_t)((Rc * 63) / 255);
+    uint8_t G6 = (uint8_t)((Gc * 63) / 255);
+    uint8_t B6 = (uint8_t)((Bc * 63) / 255);
+
+    // update each plane (clear then set bits)
+    for (int plane = 0; plane < BITPLANES; ++plane)
+    {
+        uint8_t clear_mask = lower_half ? 0x07 : 0x38; // lower or upper triplet
+        bitplane[plane][row][col] &= (uint8_t)~clear_mask;
+
+        uint8_t rbit = (R6 >> plane) & 0x01;
+        uint8_t gbit = (G6 >> plane) & 0x01;
+        uint8_t bbit = (B6 >> plane) & 0x01;
+
+        uint8_t patt = 0;
+        if (lower_half)
+            patt = (rbit << 0) | (gbit << 1) | (bbit << 2);
+        else
+            patt = (rbit << 3) | (gbit << 4) | (bbit << 5);
+
+        bitplane[plane][row][col] |= patt;
+    }
+}
+
+/* -------------------- FULL REBUILD -------------------- */
+static void rebuild_all_bitplanes(void)
+{
+    memset(bitplane, 0, sizeof(bitplane));
+    for (int sy = 0; sy < PANEL_H; ++sy)
+        for (int sx = 0; sx < PANEL_W; ++sx)
+            update_pixel_bitplanes(sx, sy);
+}
+
+/* -------------------- REFRESH TASK -------------------- */
+static void refresh_task(void *arg)
+{
+    (void)arg;
+    while (1)
+    {
+        for (int row = 0; row < SCAN; row++)
+        {
+            // set address lines (A,B,C)
+            set_pin(MASK_A, row & 1);
+            set_pin(MASK_B, (row >> 1) & 1);
+            set_pin(MASK_C, (row >> 2) & 1);
+
+            // Make sure outputs are disabled before shifting
+            set_pin(MASK_OE, 1);
+
+            // loop through each plane LSB -> MSB
+            for (int plane = 0; plane < BITPLANES; ++plane)
+            {
+                // shift row data with OE disabled
+                for (int col = 0; col < COLUMNS; col++)
+                {
+                    gpio_out_set_levels(bitplane[plane][row][col]);
+                    pulse_clk();
+                    if (col == (COLUMNS - 4)) set_pin(MASK_LE, 1); // latch near end
+                }
+                set_pin(MASK_LE, 0);
+
+                // compute OE on-time from aggregated per-channel plane times
+                uint64_t total_units = 0;
+                for (int col = 0; col < COLUMNS; col++)
+                {
+                    uint8_t patt = bitplane[plane][row][col];
+                    if (patt & 0x01) total_units += plane_time_R[plane]; // R0
+                    if (patt & 0x02) total_units += plane_time_G[plane]; // G0
+                    if (patt & 0x04) total_units += plane_time_B[plane]; // B0
+                    if (patt & 0x08) total_units += plane_time_R[plane]; // R1
+                    if (patt & 0x10) total_units += plane_time_G[plane]; // G1
+                    if (patt & 0x20) total_units += plane_time_B[plane]; // B1
+                }
+
+                uint32_t avg_units = (uint32_t)(total_units / (uint64_t)COLUMNS);
+                if (avg_units == 0) continue;
+
+                // convert units to microseconds
+                uint32_t t_us = avg_units * base_unit_us;
+
+                // display: enable outputs for t_us microseconds
+                set_pin(MASK_OE, 0); // OE low = enabled
+                if (t_us > 0) esp_rom_delay_us(t_us/(NUM_HORIZONTAL_PANELS*2));
+                set_pin(MASK_OE, 1); // disable outputs
+            }
+        }
+    }
+}
+
+/* -------------------- API -------------------- */
+void set_pixel_rgb(int sx, int sy, uint8_t r, uint8_t g, uint8_t b)
+{
+    // sanity: ensure mapper initialized
+    if (pm.total_src_w == 0 || pm.total_src_h == 0) return;
+
+    // map source virtual coordinate (sx,sy) into flattened destination (dx,dy)
+    int dx = 0, dy = 0;
+    map_src_to_flat_row_clamped(&pm, sx, sy, &dx, &dy);
+
+    // debug print (comment out in normal use)
+    //printf("Src(%2d,%2d) -> Dst(%3d,%2d)\n", sx, sy, dx, dy);
+
+    // write into framebuffer (destination coords)
+    if ((unsigned)dx >= PANEL_W || (unsigned)dy >= PANEL_H) return;
+    frame[dy][dx].r = r;
+    frame[dy][dx].g = g;
+    frame[dy][dx].b = b;
+    update_pixel_bitplanes(dx, dy);
+}
+
+/* set pwm scale per channel (1.0 normal, >1 boost) and recompute plane times,
+   then rebuild whole cache to apply change */
+void set_pwm_scales(float r_scale, float g_scale, float b_scale)
+{
+    pwm_R_scale = r_scale;
+    pwm_G_scale = g_scale;
+    pwm_B_scale = b_scale;
+    compute_plane_times();
+    rebuild_all_bitplanes();
+}
+
+void set_global_brightness(uint8_t lvl)
+{
+    if (lvl > 255) lvl = 255;
+    global_brightness = lvl;
+    rebuild_all_bitplanes();
+}
+
+void set_color_gains(float r_gain, float g_gain, float b_gain)
+{
+    R_gain = r_gain; G_gain = g_gain; B_gain = b_gain;
+    rebuild_all_bitplanes();
+}
+
+/* -------------------- MAIN -------------------- */
+void app_main(void)
+{
+    init_pins();
+    memset(frame, 0, sizeof(frame));
+    memset(bitplane, 0, sizeof(bitplane));
+
+    // compute initial per-plane times (uses pwm_*_scale and optimized units)
+    compute_plane_times();
+
+    // start refresh task
+    xTaskCreatePinnedToCore(refresh_task, "refresh_task", 4096, NULL, 1, NULL, 0);
+
+    // IMPORTANT: your physical layout is 1 (horizontal) × 3 (vertical)
+    // panel_w = 40, panel_h = 20, N = 1, M = 3
+    map_src_to_flat_row_init(&pm, 40, 20, 3, 1);
+
+    // Example: fill panel with white incrementally (will update cache per-pixel)
+    for (int y = 0; y < 20; ++y) {
+        for (int x = 0; x < 120; ++x) {
+            set_pixel_rgb(x, y, 200, 200, 255); // white
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+
+    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+
+
+/*
+
+
+
+
+
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -286,7 +752,9 @@ void app_main(void)
 
 
 
-/*
+
+
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
