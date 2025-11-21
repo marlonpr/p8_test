@@ -1,6 +1,7 @@
-// main.c
-// HUB75 driver - Mode 1 (1/5 scan per half), 6-bit per color cached bitplanes
-// Optimized: replaces panel_map table with get_panel_map_coord_fast (IRAM, always_inline)
+// main_double_buffered.c
+// HUB75 driver - Mode 1 (1/5 scan per half), 6-bit per color double-buffered bitplanes
+// Fixed color attenuation: apply gains once (pre-gamma), sane defaults for outdoor panels,
+// and compute OE-on time from bitplane weights instead of a fixed delay.
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,24 +14,22 @@
 #include <stdint.h>
 #include <math.h>
 #include <stdio.h>
+#include "font6x9.h"
+#include <assert.h>
 
 /* -------------------- PIN DEFINITIONS -------------------- */
-#define PIN_R0   GPIO_NUM_2
+#define PIN_R0   GPIO_NUM_5
 #define PIN_G0   GPIO_NUM_4
-#define PIN_B0   GPIO_NUM_5
-#define PIN_R1   GPIO_NUM_18
+#define PIN_B0   GPIO_NUM_2
+#define PIN_R1   GPIO_NUM_25
 #define PIN_G1   GPIO_NUM_19
-#define PIN_B1   GPIO_NUM_25
+#define PIN_B1   GPIO_NUM_18
 #define PIN_CLK  GPIO_NUM_13
 #define PIN_LE   GPIO_NUM_12
 #define PIN_OE   GPIO_NUM_14
 #define PIN_A    GPIO_NUM_15
 #define PIN_B    GPIO_NUM_26
 #define PIN_C    GPIO_NUM_23
-
-
-
-
 
 // -------------------- PANEL / LAYOUT CONFIG --------------------
 #define PHYSICAL_PANEL_WIDTH 40
@@ -54,6 +53,15 @@
 #define SCAN 5
 #define BIT_DEPTH 6
 #define BITPLANES BIT_DEPTH
+
+// Buffering configuration: two bitplane buffers (front/back)
+#define BITPLANE_BUFFERS 2
+
+bool white = true;
+int red = 0;
+int green = 0;
+int blue = 0;
+int usec = 1;
 
 // -------------------- PANEL MAP FAST --------------------
 typedef struct {
@@ -123,21 +131,37 @@ static inline __attribute__((always_inline)) IRAM_ATTR PixelMap get_panel_map_co
     return p;
 }
 
-// -------------------- FRAME / BITPLANE STORAGE --------------------
+// -------------------- FRAME / BITPLANE STORAGE (double-buffered) --------------------
 typedef struct { uint8_t r,g,b; } Pixel;
-static Pixel frame[PANEL_H][PANEL_W_TOTAL];
-static uint8_t bitplane[BITPLANES][SCAN][COLUMNS];
+// back/frame buffer we draw into (source coords). We'll keep a single "frame_back" for drawing
+static Pixel frame_back[PANEL_H][PANEL_W_TOTAL];
+
+// Two bitplane buffers: buffer 0 and buffer 1. Refresh task reads 'display_buf', drawing updates the other one.
+static uint8_t bitplane_buf[BITPLANE_BUFFERS][BITPLANES][SCAN][COLUMNS];
+static volatile int display_buf = 0; // index currently being scanned by refresh_task (0 or 1)
+
+// Helper macro to access the back buffer index (the one drawing code should write to)
+static inline int get_back_buf_index(void) {
+    return 1 - display_buf;
+}
 
 // -------------------- PWM / TIMING --------------------
+// keep the same optimized plane weights; you can tune these if desired
 static const uint32_t optimized_plane_units[BITPLANES] = {1,2,4,8,12,18};
 static uint32_t plane_time_R[BITPLANES], plane_time_G[BITPLANES], plane_time_B[BITPLANES];
-static float pwm_R_scale = 0.6f, pwm_G_scale = 0.5f, pwm_B_scale = 200.0f;
-static uint32_t base_unit_us = 1;
-static float R_gain = 0.6f, G_gain = 0.5f, B_gain = 50.0f;
-static uint8_t global_brightness = 255;
+
+// IMPORTANT: default pwm scales set to 1.0 to avoid double scaling.
+// Color correction is handled by R_gain/G_gain/B_gain BEFORE gamma.
+static float pwm_R_scale = 1.0f, pwm_G_scale = 1.0f, pwm_B_scale = 1.0f;
+static uint32_t base_unit_us = 80;    // multiplier to convert plane units -> microseconds (tunable)
+
+// default outdoor gains (start here, then tune)
+static float R_gain = 4.0f, G_gain = 1.0f, B_gain = 6.0f;
+static uint8_t global_brightness = 120; // 0..255, lower for indoor viewing
+
 /* -------------------- 256-value gamma table (gamma = 2.2) --------------- */
 static const uint8_t gamma8[256] = {
-    /* same table as before (kept for brevity) */
+    /* kept as before */
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,
     1,1,1,1,2,2,2,2,3,3,3,4,4,4,5,5,
@@ -155,6 +179,7 @@ static const uint8_t gamma8[256] = {
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255
 };
+
 #define BITPIN(pin) (1U << (pin))
 static const uint32_t MASK_R0 = BITPIN(PIN_R0), MASK_G0 = BITPIN(PIN_G0), MASK_B0 = BITPIN(PIN_B0);
 static const uint32_t MASK_R1 = BITPIN(PIN_R1), MASK_G1 = BITPIN(PIN_G1), MASK_B1 = BITPIN(PIN_B1);
@@ -185,21 +210,58 @@ static void init_pins(void) {
     gpio_config_t io = { .pin_bit_mask = mask, .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
     gpio_config(&io);
     GPIO.out_w1tc = mask;
-    GPIO.out_w1ts = MASK_OE;
+    GPIO.out_w1ts = MASK_OE; // disable outputs initially (OE high)
 }
 
 static void compute_plane_times(void) {
     for (int i = 0; i < BITPLANES; ++i) {
         uint32_t u = optimized_plane_units[i];
+        // One unit = base_unit_us microseconds multiplied by per-channel scale
         plane_time_R[i] = (uint32_t)((float)u * pwm_R_scale);
         plane_time_G[i] = (uint32_t)((float)u * pwm_G_scale);
         plane_time_B[i] = (uint32_t)((float)u * pwm_B_scale);
     }
 }
 
-// -------------------- BITPLANE BUILD / UPDATE --------------------
-static void update_pixel_bitplanes(int dx, int dy) {
+// -------------------- IRAM fast memzero (used for clearing back buffer) --------------------
+static inline void IRAM_ATTR fast_memzero32(void *buf, size_t size_bytes)
+{
+    if (buf == NULL || size_bytes == 0) return;
+
+    uint32_t *p = (uint32_t *)buf;
+    uint32_t *end = (uint32_t *)((uint8_t *)buf + (size_bytes & ~(size_t)3));
+
+    // Unrolled clear: 8 words per loop
+    while (p + 8 <= end) {
+        p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 0;
+        p[4] = 0; p[5] = 0; p[6] = 0; p[7] = 0;
+        p += 8;
+    }
+    while (p < end) *p++ = 0;
+
+    // handle remaining tail bytes (if size not multiple of 4)
+    size_t rem = size_bytes & 3;
+    if (rem) {
+        uint8_t *tail = (uint8_t *)((uint8_t *)buf + (size_bytes - rem));
+        for (size_t i = 0; i < rem; ++i) tail[i] = 0;
+    }
+}
+
+// Clear back buffers (frame_back and bitplane back buffer)
+static inline void clear_back_buffers_fast(void)
+{
+    // clear frame_back
+    fast_memzero32((void*)frame_back, sizeof(frame_back));
+    // clear back bitplane buffer
+    int b = get_back_buf_index();
+    fast_memzero32((void*)bitplane_buf[b], sizeof(bitplane_buf[b]));
+}
+
+// -------------------- BITPLANE BUILD / UPDATE (write into back buffer) --------------------
+static inline void update_pixel_bitplanes_back(int dx, int dy) {
     if ((unsigned)dx >= (unsigned)PANEL_W_TOTAL || (unsigned)dy >= (unsigned)PANEL_H) return;
+
+    int back = get_back_buf_index();
 
     // which panel along the flattened row (0 .. N*M-1)
     int panel_index = dx / pm.panel_w;
@@ -219,11 +281,13 @@ static void update_pixel_bitplanes(int dx, int dy) {
     int row = p.y;
     int col = global_col; // index into bitplane[plane][row][col]
 
-    Pixel src = frame[dy][dx];
+    Pixel src = frame_back[dy][dx];
 
-    int r = (int)((float)src.r * R_gain * ((float)global_brightness / 255.0f) + 0.5f);
-    int g = (int)((float)src.g * G_gain * ((float)global_brightness / 255.0f) + 0.5f);
-    int b = (int)((float)src.b * B_gain * ((float)global_brightness / 255.0f) + 0.5f);
+    // Apply color gains once, before gamma. Also apply global_brightness scaling (0..255)
+    float brightness_scale = ((float)global_brightness / 255.0f);
+    int r = (int)((float)src.r * R_gain * brightness_scale + 0.5f);
+    int g = (int)((float)src.g * G_gain * brightness_scale + 0.5f);
+    int b = (int)((float)src.b * B_gain * brightness_scale + 0.5f);
 
     if (r < 0) r = 0; else if (r > 255) r = 255;
     if (g < 0) g = 0; else if (g > 255) g = 255;
@@ -236,47 +300,106 @@ static void update_pixel_bitplanes(int dx, int dy) {
 
     for (int plane = 0; plane < BITPLANES; ++plane) {
         uint8_t clear_mask = lower ? 0x07 : 0x38;
-        bitplane[plane][row][col] &= (uint8_t)~clear_mask;
+        bitplane_buf[back][plane][row][col] &= (uint8_t)~clear_mask;
 
         uint8_t rbit = (R6 >> plane) & 1;
         uint8_t gbit = (G6 >> plane) & 1;
         uint8_t bbit = (B6 >> plane) & 1;
         uint8_t patt = lower ? ((rbit<<0)|(gbit<<1)|(bbit<<2)) : ((rbit<<3)|(gbit<<4)|(bbit<<5));
 
-        bitplane[plane][row][col] |= patt;
+        bitplane_buf[back][plane][row][col] |= patt;
+    }
+}
+
+// Rebuild all bitplanes into back buffer from frame_back
+// Rebuild all bitplanes into back buffer from frame_back
+// Also compute row_plane_avg for the back buffer to avoid scanning COLUMNS at refresh time.
+// per-buffer, per-plane, per-row average plane units (computed at rebuild)
+static uint32_t row_plane_avg[BITPLANE_BUFFERS][BITPLANES][SCAN];
+
+
+
+static void rebuild_all_bitplanes_back(void) {
+    int back = get_back_buf_index();
+
+    // clear back bitplanes & averages first
+    fast_memzero32((void*)bitplane_buf[back], sizeof(bitplane_buf[back]));
+    for (int p = 0; p < BITPLANES; ++p) {
+        for (int r = 0; r < SCAN; ++r) {
+            row_plane_avg[back][p][r] = 0;
+        }
+    }
+
+    // Build bitplanes and accumulate per-plane per-row totals (units)
+    for (int y = 0; y < PANEL_H; ++y) {
+        for (int x = 0; x < PANEL_W_TOTAL; ++x) {
+            // This will set bits in bitplane_buf[back] for the pixel
+            update_pixel_bitplanes_back(x, y);
+        }
+    }
+
+    // After the bitplane buffer is populated, compute per-row/plane averages.
+    // We compute totals in "units" consistent with plane_time_* arrays.
+    for (int plane = 0; plane < BITPLANES; ++plane) {
+        for (int row = 0; row < SCAN; ++row) {
+            uint64_t total_units = 0;
+            for (int col = 0; col < COLUMNS; ++col) {
+                uint8_t p = bitplane_buf[back][plane][row][col];
+                if (p & 1) total_units += plane_time_R[plane];
+                if (p & 2) total_units += plane_time_G[plane];
+                if (p & 4) total_units += plane_time_B[plane];
+                if (p & 8) total_units += plane_time_R[plane];
+                if (p & 16) total_units += plane_time_G[plane];
+                if (p & 32) total_units += plane_time_B[plane];
+            }
+            // average units per column (rounded)
+            uint32_t avg = (uint32_t)(total_units / (uint64_t)COLUMNS);
+            row_plane_avg[back][plane][row] = avg;
+        }
     }
 }
 
 
-static void rebuild_all_bitplanes(void) {
-    memset(bitplane, 0, sizeof(bitplane));
-    for (int y = 0; y < PANEL_H; ++y) {
-        for (int x = 0; x < PANEL_W_TOTAL; ++x) {
-            update_pixel_bitplanes(x, y);
-        }
-    }
+// -------------------- SWAP / SYNCHRONIZATION --------------------
+// Swap the back buffer to become the display buffer. Use critical section to make the update atomic.
+static  portMUX_TYPE swap_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void swap_bitplanes(void)
+{
+    taskENTER_CRITICAL(&swap_mux);
+    display_buf = 1 - display_buf;
+    taskEXIT_CRITICAL(&swap_mux);
 }
 
 // -------------------- REFRESH TASK --------------------
 static void refresh_task(void *arg) {
     (void)arg;
     while (1) {
+        int buf = display_buf; // capture current display buffer index (cheap read)
         for (int row = 0; row < SCAN; ++row) {
             set_pin(MASK_A, row & 1);
             set_pin(MASK_B, (row >> 1) & 1);
             set_pin(MASK_C, (row >> 2) & 1);
-            set_pin(MASK_OE, 1);
+            
             for (int plane = 0; plane < BITPLANES; ++plane) {
-                for (int col = 0; col < COLUMNS; ++col) {
-                    gpio_out_set_levels(bitplane[plane][row][col]);
+                for (int col = 0; col < COLUMNS*1; ++col) {
+                    gpio_out_set_levels(bitplane_buf[buf][plane][row][col]);
                     pulse_clk();
-                    if (col == COLUMNS - 4) set_pin(MASK_LE, 1);
+                    if (col == COLUMNS*1 - 4)
+                    {
+						
+						//esp_rom_delay_us(10);
+						set_pin(MASK_OE, 1); // disable outputs while shifting
+						set_pin(MASK_LE, 1);
+					} 
                 }
+                //for(int i = 0; i < 400000; i++);
                 set_pin(MASK_LE, 0);
 
+                // compute average weighted time for this plane across the row
                 uint64_t total = 0;
                 for (int col = 0; col < COLUMNS; ++col) {
-                    uint8_t p = bitplane[plane][row][col];
+                    uint8_t p = bitplane_buf[buf][plane][row][col];
                     if (p & 1) total += plane_time_R[plane];
                     if (p & 2) total += plane_time_G[plane];
                     if (p & 4) total += plane_time_B[plane];
@@ -286,54 +409,215 @@ static void refresh_task(void *arg) {
                 }
                 uint32_t avg = (uint32_t)(total / (uint64_t)COLUMNS);
                 if (!avg) continue;
+
+                // convert avg units into microseconds using base_unit_us
                 uint32_t t_us = avg * base_unit_us;
+                // clamp to reasonable min/max to avoid too-short or too-long pulses
+                if (t_us < 1) t_us = 1;
+                if (t_us > 20000) t_us = 20000; // 20 ms max per plane (prevent lockup)
+
+                // show the plane by enabling outputs
                 set_pin(MASK_OE, 0);
-                if (t_us > 0) esp_rom_delay_us(t_us / (PANELS_ACROSS * PANELS_DOWN * 2));
-                set_pin(MASK_OE, 1);
+                esp_rom_delay_us(600);
+                for(int i = 0; i < 70000; i++)
+                {
+			    	__asm__ __volatile__("nop;nop;nop;");
+				}
+                
+                
+                
+                
+                
             }
         }
     }
 }
 
 // -------------------- API --------------------
-void set_pixel_rgb(int sx, int sy, uint8_t r, uint8_t g, uint8_t b) {
+// Note: set_pixel_rgb writes into the back frame and updates the back bitplanes
+void set_pixel_rgb_back(int sx, int sy, uint8_t r, uint8_t g, uint8_t b) {
     if (pm.total_src_w == 0 || pm.total_src_h == 0) return;
     int dx = 0, dy = 0;
     map_src_to_flat_row_clamped(&pm, sx, sy, &dx, &dy);
     if ((unsigned)dx >= (unsigned)PANEL_W_TOTAL || (unsigned)dy >= (unsigned)PANEL_H) return;
-    frame[dy][dx].r = r;
-    frame[dy][dx].g = g;
-    frame[dy][dx].b = b;
-    update_pixel_bitplanes(dx, dy);
+    frame_back[dy][dx].r = r;
+    frame_back[dy][dx].g = g;
+    frame_back[dy][dx].b = b;
+    update_pixel_bitplanes_back(dx, dy);
+}
+
+// Convenience API to prepare a new frame: clear back buffers, draw into frame_back using set_pixel_rgb_back(), then call present_frame_back() to swap.
+void prepare_frame_back(void) {
+    clear_back_buffers_fast();
+}
+
+void present_frame_back(void) {
+    // Rebuild bitplanes fully (ensures any pixels not individually updated are correct)
+    rebuild_all_bitplanes_back();
+
+    // atomically swap the back buffer into view
+    swap_bitplanes();
 }
 
 void set_pwm_scales(float r_scale, float g_scale, float b_scale) {
     pwm_R_scale = r_scale; pwm_G_scale = g_scale; pwm_B_scale = b_scale;
     compute_plane_times();
-    rebuild_all_bitplanes();
+    // caller should rebuild/present to reflect change
 }
-void set_global_brightness(uint8_t lvl) { if (lvl > 255) lvl = 255; global_brightness = lvl; rebuild_all_bitplanes(); }
-void set_color_gains(float r_gain, float g_gain, float b_gain) { R_gain = r_gain; G_gain = g_gain; B_gain = b_gain; rebuild_all_bitplanes(); }
+void set_global_brightness(uint8_t lvl) { if (lvl > 255) lvl = 255; global_brightness = lvl; /* caller should rebuild and present if they want immediate effect */ }
+void set_color_gains(float r_gain, float g_gain, float b_gain) { R_gain = r_gain; G_gain = g_gain; B_gain = b_gain; /* caller should rebuild/present */ }
+
+
+
+void draw_char_back(int sx, int sy, char c, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (c < 32 || c > 126) return;
+
+    // Each glyph is [9][6]
+    const uint8_t (*glyph)[6] = font6x9[c - 32];
+
+    for (int row = 0; row < 9; row++) {
+        for (int col = 0; col < 6; col++) {
+            if (glyph[row][col]) {
+                set_pixel_rgb_back(sx + col, sy + row, r, g, b);
+            }
+            // else: background transparent
+        }
+    }
+}
+
+
+void draw_text_back(int sx, int sy, const char *str, uint8_t r, uint8_t g, uint8_t b)
+{
+    int x = sx;
+    while (*str) {
+        draw_char_back(x, sy, *str, r, g, b);
+        x += 7;  // 6px glyph + 1px space
+        str++;
+    }
+}
+
+// clear a rectangular region in source coordinates in the back buffer
+void clear_region_back(int sx, int sy, int w, int h)
+{
+    if (pm.total_src_w == 0 || pm.total_src_h == 0) return;
+
+    // clamp to source area
+    if (sx < 0) { w += sx; sx = 0; }
+    if (sy < 0) { h += sy; sy = 0; }
+    if (sx >= pm.total_src_w || sy >= pm.total_src_h) return;
+    if (sx + w > pm.total_src_w) w = pm.total_src_w - sx;
+    if (sy + h > pm.total_src_h) h = pm.total_src_h - sy;
+    if (w <= 0 || h <= 0) return;
+
+    for (int y = sy; y < sy + h; ++y) {
+        for (int x = sx; x < sx + w; ++x) {
+            int dx = 0, dy = 0;
+            map_src_to_flat_row_clamped(&pm, x, y, &dx, &dy);
+            // clear frame pixel in back buffer
+            frame_back[dy][dx].r = 0;
+            frame_back[dy][dx].g = 0;
+            frame_back[dy][dx].b = 0;
+            // update back bitplanes for this pixel
+            update_pixel_bitplanes_back(dx, dy);
+        }
+    }
+}
+
+// -------------------- DRAWING TASK (example counter) --------------------
+void drawing_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(50));   // allow refresh_task to start
+
+    int counter = 0;
+    char buf[25];   // up to "9999" + null
+
+    while (1) {
+        // Clear + rebuild back framebuffer
+        prepare_frame_back();
+
+        // Format counter 0–999
+        sprintf(buf, "%04d", counter);
+
+        // Draw text
+        draw_text_back(6, 4, buf, 255, 0, 0);  // green
+
+        // Swap buffers safely
+        present_frame_back();
+
+        // Increment & wrap
+        counter++;
+        if (counter >= 1000) counter = 0;
+
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
 
 // -------------------- MAIN --------------------
 void app_main(void)
 {
     init_pins();
-    memset(frame, 0, sizeof(frame));
-    memset(bitplane, 0, sizeof(bitplane));
-
-    compute_plane_times();
-
-    xTaskCreatePinnedToCore(refresh_task, "refresh_task", 4096, NULL, 1, NULL, 0);
 
     // initialize mapping: N = panels across, M = panels down
     map_src_to_flat_row_init(&pm, PHYSICAL_PANEL_WIDTH, PHYSICAL_PANEL_HEIGHT, PANELS_ACROSS, PANELS_DOWN);
 
-    // quick sanity asserts
+    // sanity asserts
     assert(pm.total_src_w == PHYSICAL_PANEL_WIDTH * pm.N);
     assert(pm.total_src_h == PHYSICAL_PANEL_HEIGHT * pm.M);
     assert(PANEL_W_TOTAL == pm.panel_w * pm.N * pm.M);
 
+    // clear both bitplane buffers and frame_back
+    fast_memzero32((void*)bitplane_buf, sizeof(bitplane_buf));
+    fast_memzero32((void*)frame_back, sizeof(frame_back));
+
+    // compute plane times using default pwm scales
+    compute_plane_times();
+
+    // apply sensible defaults (outdoor starts): you can tune these at runtime with set_color_gains()
+    set_color_gains(10000.0f, 10000.0f, 10000.0f);     // boost red & blue pre-gamma
+    set_global_brightness(255);            // lower than 255 for indoor; increase for outdoor
+    set_pwm_scales(30000.0f, 30000.0f, 30000.0f);     // per-channel scale units
+    
+    fast_memzero32((void*)row_plane_avg, sizeof(row_plane_avg));
+
+
+    // start refresh task on core 0
+    xTaskCreatePinnedToCore(refresh_task, "refresh_task", 4096, NULL, 1, NULL, 0);
+    // start drawing task on core 1
+    xTaskCreatePinnedToCore(drawing_task, "drawing_task", 8192, NULL, 1, NULL, 1);
+
+    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
     // Diagnostic for last panel mapping
     int last_panel_index = pm.M * pm.N - 1;
     int panel_start_dx = last_panel_index * pm.panel_w;
@@ -342,19 +626,23 @@ void app_main(void)
         PixelMap p = get_panel_map_coord_fast(0, lx); // test row 0
         printf("lx=%2d -> p.x=%2d p.y=%2d\n", lx, p.x, p.y);
     }
+    
+    
+    
+    
+    
+*/ 
 
-    // Example: fill virtual source area incrementally (updates cache per-pixel)
+
+/*
     for (int y = 0; y < pm.total_src_h; ++y) {
-        for (int x = 0; x < pm.total_src_w; ++x) {
-            set_pixel_rgb(x, y, 200, 200, 255); // white-ish
+        for (int x = 0; x < pm.total_src_w; ++x) 
+        {
+            set_pixel_rgb(x, y, red, green, blue); // white-ish
             vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
-
-    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-}
-
-
+*/
 /*
 
 
