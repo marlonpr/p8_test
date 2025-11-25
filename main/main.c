@@ -17,13 +17,22 @@
 #include "font6x9.h"
 #include <assert.h>
 
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <ctype.h>
+
+#include "soc/gpio_struct.h"
+
 /* -------------------- PIN DEFINITIONS -------------------- */
 #define PIN_R0   GPIO_NUM_5
 #define PIN_G0   GPIO_NUM_4
 #define PIN_B0   GPIO_NUM_2
-#define PIN_R1   GPIO_NUM_25
+#define PIN_R1   GPIO_NUM_18
 #define PIN_G1   GPIO_NUM_19
-#define PIN_B1   GPIO_NUM_18
+#define PIN_B1   GPIO_NUM_25
 #define PIN_CLK  GPIO_NUM_13
 #define PIN_LE   GPIO_NUM_12
 #define PIN_OE   GPIO_NUM_14
@@ -36,7 +45,7 @@
 #define PHYSICAL_PANEL_HEIGHT 20
 
 // virtual grid: N = panels across; M = panels down
-#define VIRTUAL_NUM_PANEL_HORIZONTAL 1
+#define VIRTUAL_NUM_PANEL_HORIZONTAL 2
 #define VIRTUAL_NUM_PANEL_VERTICAL   1
 
 #define PANELS_ACROSS (VIRTUAL_NUM_PANEL_HORIZONTAL)
@@ -57,11 +66,413 @@
 // Buffering configuration: two bitplane buffers (front/back)
 #define BITPLANE_BUFFERS 2
 
-bool white = true;
-int red = 0;
-int green = 0;
-int blue = 0;
-int usec = 1;
+
+/* ---------------- UART command -> register write integration ---------------- */
+
+#include "driver/uart.h"
+
+#define UART_RX_BUF_SIZE 512
+#define UART_PORT UART_NUM_0
+
+/* Forward declarations (if not already visible in file) */
+void write_reg1(uint16_t r_up, uint8_t r_igain, uint8_t r_v0p3, uint8_t r_v1p26);
+void write_reg2(uint16_t reg2_value);
+void reset_oen_protocol(void);
+void write_reg2_map_test(void);
+
+static volatile uint16_t last_reg1;
+static volatile uint16_t last_reg2;
+
+
+
+/* Initialize UART0 for simple line-based commands */
+static void uart_init_console(void)
+{
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_param_config(UART_PORT, &uart_config);
+    uart_driver_install(UART_PORT, UART_RX_BUF_SIZE * 2, 0, 0, NULL, 0);
+    // Use default pins for UART0 (TX0/RX0) on most ESP32 boards
+}
+
+/* Replacement uart_command_task: accumulate bytes until newline, echo, handle backspace */
+static void process_uart_line(char *line); // forward
+
+static void uart_command_task(void *arg)
+{
+    (void)arg;
+    const int RX_BUF_SIZE = 256;
+    uint8_t *rxbuf = (uint8_t *)malloc(RX_BUF_SIZE);
+    if (!rxbuf) vTaskDelete(NULL);
+
+    /* Avoid name collisions with macros: use LINE_BUF_MAX */
+    const size_t LINE_BUF_MAX = 128;
+    char line[LINE_BUF_MAX];
+    size_t idx = 0;
+
+    printf("UART command task started. Commands: BRIGHT MAX | REG1 r_up igain v0p3 v1p26 | REG2 0xHHHH | DUMP\n");
+
+    while (1) {
+        int len = uart_read_bytes(UART_PORT, rxbuf, RX_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+        if (len <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        for (int i = 0; i < len; ++i) {
+            char c = (char)rxbuf[i];
+
+            if (c == '\r' || c == '\n') {
+                /* Echo newline */
+                const char *nl = "\r\n";
+                uart_write_bytes(UART_PORT, nl, 2);
+
+                if (idx > 0) {
+                    line[idx] = '\0';
+                    process_uart_line(line);
+                    idx = 0;
+                } else {
+                    /* empty line -> ignore */
+                }
+            } else if (c == 0x7F || c == 0x08) { /* DEL or BS */
+                if (idx > 0) {
+                    idx--;
+                    /* erase on terminal: backspace, space, backspace */
+                    const char *bs = "\b \b";
+                    uart_write_bytes(UART_PORT, bs, 3);
+                }
+            } else if ((unsigned char)c >= 32 && idx < LINE_BUF_MAX - 1) {
+                /* printable char: append and echo */
+                line[idx++] = c;
+                uart_write_bytes(UART_PORT, &c, 1);
+            } else {
+                /* ignore non-printable or overflow */
+            }
+        }
+    }
+
+    free(rxbuf);
+    vTaskDelete(NULL);
+}
+
+
+
+/* Process a full line (command) */
+static void process_uart_line(char *line)
+{
+    while (*line && isspace((unsigned char)*line)) ++line;
+    if (!*line) return;
+
+    char *tok = strtok(line, " \t");
+    if (!tok) return;
+
+
+/* ----------------- UART command integration (add to your line parser) -----------------
+   Insert the following branch into your process_uart_line() function so the UART console
+   accepts the REG2MAP command. Keep your existing BRIGHT/REG1/REG2 handlers.
+*/
+
+
+/* inside process_uart_line, next to BRIGHT MAX handling */
+if (strcasecmp(tok, "BRIGHT") == 0) {
+    char *arg1 = strtok(NULL, " \t");
+    if (arg1 && strcasecmp(arg1, "MAX") == 0) {
+        /* existing MAX code */
+        uint16_t r_up = 31;
+        uint8_t r_igain = 0x0F;
+        uint8_t r_v0p3 = 0x07;
+        uint8_t r_v1p26 = 0x0F;
+        write_reg1(r_up, r_igain, r_v0p3, r_v1p26);
+        write_reg2(0xFFFF);
+        reset_oen_protocol();
+        printf("BRIGHT MAX -> REG1=0x%04X REG2=0x%04X\n", last_reg1, last_reg2);
+    } else if (arg1 && strcasecmp(arg1, "MIN") == 0) {
+        /* NEW: minimum brightness values (tune if needed) */
+        uint16_t r_up = 0;        // smallest 5-bit value
+        uint8_t r_igain = 0x00;   // smallest 4-bit value
+        uint8_t r_v0p3 = 0x00;    // smallest 3-bit value
+        uint8_t r_v1p26 = 0x00;   // smallest 4-bit value
+        write_reg1(r_up, r_igain, r_v0p3, r_v1p26);
+
+        /* REG2: clear timing bits to favor minimum drive (example) */
+        uint16_t reg2 = 0x0000;
+        write_reg2(reg2);
+
+        /* Some devices require RESET_OEN after REG2 changes */
+        reset_oen_protocol();
+
+        printf("BRIGHT MIN -> REG1=0x%04X REG2=0x%04X\n", last_reg1, last_reg2);
+    } else {
+        printf("Usage: BRIGHT MAX or BRIGHT MIN\n");
+    }
+    return;
+}
+
+}
+
+/* -------------------- Helper to start UART command task -------------------- */
+void start_uart_command_interface(void)
+{
+    uart_init_console();
+    xTaskCreate(uart_command_task, "uart_cmd", 4096, NULL, 5, NULL);
+}
+
+/* -------------------- Example integration in app_main --------------------
+   Call start_uart_command_interface() from app_main after GPIO and driver init.
+*/
+
+
+
+
+
+
+
+
+#define NUM_IC_PER_ROW 5    // driver chips per row (16-bit words each)
+#define USE_LSB_FIRST 0      // 0 = MSB-first, 1 = LSB-first
+
+/* ----------------- LOW-LEVEL GPI OS ----------------- */
+#define GPIO_SET(pin)    (GPIO.out_w1ts = (1U << (pin)))
+#define GPIO_CLR(pin)    (GPIO.out_w1tc = (1U << (pin)))
+
+
+
+static inline void IRAM_ATTR short_nop_delay(void)
+{
+    // ~30 nops ≈ 100-150ns at 240MHz. Adjust when needed.
+    asm volatile(
+        "nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t"
+        "nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t"
+        "nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t""nop\n\t"
+        ::: "memory");
+}
+
+// Data valid before rising edge; sample on rising edge
+static inline void IRAM_ATTR rul_clock_pulse_with_data(uint8_t bit)
+{
+    if (bit) GPIO_SET(PIN_R0);
+    else     GPIO_CLR(PIN_R0);
+
+    GPIO_CLR(PIN_CLK);
+    asm volatile ("" ::: "memory");
+    GPIO_SET(PIN_CLK);  // rising edge -> sampled by device
+    short_nop_delay();  // hold high to satisfy hold spec
+    GPIO_CLR(PIN_CLK);
+}
+
+void IRAM_ATTR rul_spi_send_bits(uint64_t data, int bit_count)
+{
+    for (int i = bit_count - 1; i >= 0; --i) {
+        uint8_t bit = (data >> i) & 1;
+        rul_clock_pulse_with_data(bit);
+    }
+}
+
+void IRAM_ATTR rul_spi_send_bits_lsb_first(uint64_t data, int bit_count)
+{
+    for (int i = 0; i < bit_count; ++i) {
+        uint8_t bit = (data >> i) & 1;
+        rul_clock_pulse_with_data(bit);
+    }
+}
+
+/* ----------------- LE (LAT) command helper ----------------- */
+// Raise LAT, generate clk_count rising edges, lower LAT.
+/* ----------------- LE (LAT) command helper ----------------- */
+// Raise LAT, generate clk_count rising edges, lower LAT.
+/* ----------------- ROBUST LE (LAT) COMMAND ----------------- */
+void IRAM_ATTR rul_le_command(int clk_count)
+{
+    GPIO_SET(PIN_LE);
+    short_nop_delay(); short_nop_delay(); // Setup time
+
+    for (int i = 0; i < clk_count; ++i) {
+        GPIO_CLR(PIN_CLK);
+        short_nop_delay(); 
+        GPIO_SET(PIN_CLK);
+        short_nop_delay(); 
+        GPIO_CLR(PIN_CLK);
+    }
+    
+    short_nop_delay(); short_nop_delay(); // Hold time
+    GPIO_CLR(PIN_LE);
+    short_nop_delay();
+}
+/* ----------------- Register write helpers ----------------- */
+/* Keep last written values for DUMP and runtime tracking */
+//static inline void IRAM_ATTR data_latch_cmd(void) { rul_le_command(3); }
+static inline void IRAM_ATTR wr_reg1_cmd(void)    { rul_le_command(11); }
+static inline void IRAM_ATTR wr_reg2_cmd(void)    { rul_le_command(12); }
+// Pre-Active Command: LE High for 14 clocks. 
+// Required by many chips to unlock register writing.
+static inline void IRAM_ATTR wr_pre_active_cmd(void) { rul_le_command(14); }
+
+
+void IRAM_ATTR rul_spi_send_bits_slow(uint64_t data, int bit_count)
+{
+    for (int i = bit_count - 1; i >= 0; --i) {
+        uint8_t bit = (data >> i) & 1;
+        
+        // Setup Data
+        if (bit) GPIO_SET(PIN_R0);
+        else     GPIO_CLR(PIN_R0);
+        
+        // Slow Clock Pulse
+        GPIO_CLR(PIN_CLK);
+        short_nop_delay(); short_nop_delay(); // Extra delay
+        GPIO_SET(PIN_CLK);
+        short_nop_delay(); short_nop_delay(); // Extra delay (hold time)
+        GPIO_CLR(PIN_CLK);
+    }
+}
+/* modify write_reg1 */
+/* ----------------- Broadcast register writes + REG2 map test ----------------- */
+
+/* Keep last written values for runtime inspection */
+static volatile uint16_t last_reg1 = 0xFFFF;
+static volatile uint16_t last_reg2 = 0xFFFF;
+
+/* Broadcast REG1: send same 16-bit REG1 word to every chip, then WR_REG1 */
+/* ----------------- FINAL ROBUST REGISTER WRITES ----------------- */
+
+void write_reg1(uint16_t r_up, uint8_t r_igain, uint8_t r_v0p3, uint8_t r_v1p26)
+{
+    // 1. Pack the Register
+    uint16_t reg1 = (uint16_t)((((r_up & 0x1F) << 11) |
+                                ((r_igain & 0x0F) << 7) |
+                                ((r_v0p3 & 0x07) << 4) |
+                                (r_v1p26 & 0x0F)) & 0xFFFF);
+
+    // 2. Double-Write Strategy
+    for(int retry = 0; retry < 2; retry++) {
+        // Shift Data to all 5 chips
+        for (int i = 0; i < NUM_IC_PER_ROW; ++i) { 
+             rul_spi_send_bits((uint64_t)reg1, 16);
+        }
+
+        // Latch Command (11 clocks)
+        wr_reg1_cmd();
+
+        // Post-Latch Clock Pulse (The "Magic Fix")
+        short_nop_delay();
+        GPIO_SET(PIN_CLK);
+        short_nop_delay();
+        GPIO_CLR(PIN_CLK);
+        
+        // Short delay between retries
+        short_nop_delay(); short_nop_delay(); short_nop_delay();
+    }
+
+    last_reg1 = reg1;
+    // printf("REG1 Written: 0x%04X\n", last_reg1); // Uncomment for debug
+}
+
+void write_reg2(uint16_t reg2_value)
+{
+    // 2. Double-Write Strategy
+    for(int retry = 0; retry < 2; retry++) {
+        // Shift Data to all 5 chips
+        for (int i = 0; i < NUM_IC_PER_ROW; ++i) {
+            rul_spi_send_bits((uint64_t)reg2_value, 16);
+        }
+
+        // Latch Command (12 clocks)
+        wr_reg2_cmd();
+
+        // Post-Latch Clock Pulse
+        short_nop_delay();
+        GPIO_SET(PIN_CLK);
+        short_nop_delay();
+        GPIO_CLR(PIN_CLK);
+
+        // Short delay between retries
+        short_nop_delay(); short_nop_delay(); short_nop_delay();
+    }
+
+    last_reg2 = reg2_value;
+    // printf("REG2 Written: 0x%04X\n", last_reg2); // Uncomment for debug
+}
+
+
+// RESET_OEN protocol: datasheet defines LE widths 1 then 2
+void reset_oen_protocol(void)
+{
+    // LE width = 1
+    GPIO_SET(PIN_LE);
+    asm volatile("" ::: "memory");
+    GPIO_CLR(PIN_R0);
+    GPIO_CLR(PIN_CLK);
+    asm volatile("" ::: "memory");
+    GPIO_SET(PIN_CLK);
+    short_nop_delay();
+    GPIO_CLR(PIN_CLK);
+    GPIO_CLR(PIN_LE);
+    asm volatile("" ::: "memory");
+
+    // LE width = 2
+    GPIO_SET(PIN_LE);
+    for (int i = 0; i < 2; ++i) {
+        GPIO_CLR(PIN_R0);
+        GPIO_CLR(PIN_CLK);
+        asm volatile("" ::: "memory");
+        GPIO_SET(PIN_CLK);
+        short_nop_delay();
+        GPIO_CLR(PIN_CLK);
+    }
+    GPIO_CLR(PIN_LE);
+}
+
+/* ----------------- Configure sensible defaults ----------------- */
+void configure_min(void)
+{
+    // REG1 defaults: r_up=5, r_igain=0x0F (high), r_v0p3=7, r_v1p26=0
+        /* NEW: minimum brightness values (tune if needed) */
+        uint16_t r_up = 0;        // smallest 5-bit value
+        uint8_t r_igain = 0x00;   // smallest 4-bit value
+        uint8_t r_v0p3 = 0x00;    // smallest 3-bit value
+        uint8_t r_v1p26 = 0x00;   // smallest 4-bit value
+        write_reg1(r_up, r_igain, r_v0p3, r_v1p26);
+
+        /* REG2: clear timing bits to favor minimum drive (example) */
+        uint16_t reg2 = 0x0000;
+        write_reg2(reg2);
+
+        /* Some devices require RESET_OEN after REG2 changes */
+        reset_oen_protocol();
+
+        printf("BRIGHT MIN -> REG1=0x%04X REG2=0x%04X\n", last_reg1, last_reg2);
+}
+
+/* ----------------- Configure sensible defaults ----------------- */
+void configure_max(void)
+{
+    // REG1 defaults: r_up=5, r_igain=0x0F (high), r_v0p3=7, r_v1p26=0
+        /* existing MAX code */
+        uint16_t r_up = 31;
+        uint8_t r_igain = 0x0F;
+        uint8_t r_v0p3 = 0x07;
+        uint8_t r_v1p26 = 0x0F;
+		// Inside your BRIGHT MAX handler or function
+		GPIO_SET(PIN_OE); // Force Display OFF (High)
+		short_nop_delay();
+		
+		write_reg1(r_up, r_igain, r_v0p3, r_v1p26);
+		write_reg2(0xFFFF);
+		reset_oen_protocol();
+		
+		// OE will be handled by the refresh task later, 
+		// but forcing it High here ensures clean latching.
+        printf("BRIGHT MAX -> REG1=0x%04X REG2=0x%04X\n", last_reg1, last_reg2);
+
+    // Reset OEN state machine after reg2 change
+    reset_oen_protocol();
+}
+
 
 // -------------------- PANEL MAP FAST --------------------
 typedef struct {
@@ -153,7 +564,7 @@ static uint32_t plane_time_R[BITPLANES], plane_time_G[BITPLANES], plane_time_B[B
 // IMPORTANT: default pwm scales set to 1.0 to avoid double scaling.
 // Color correction is handled by R_gain/G_gain/B_gain BEFORE gamma.
 static float pwm_R_scale = 1.0f, pwm_G_scale = 1.0f, pwm_B_scale = 1.0f;
-static uint32_t base_unit_us = 80;    // multiplier to convert plane units -> microseconds (tunable)
+static uint32_t base_unit_us = 5;    // multiplier to convert plane units -> microseconds (tunable)
 
 // default outdoor gains (start here, then tune)
 static float R_gain = 4.0f, G_gain = 1.0f, B_gain = 6.0f;
@@ -371,32 +782,29 @@ void swap_bitplanes(void)
     taskEXIT_CRITICAL(&swap_mux);
 }
 
+
 // -------------------- REFRESH TASK --------------------
-static void refresh_task(void *arg) {
+static void refresh_task(void *arg)
+{
     (void)arg;
     while (1) {
-        int buf = display_buf; // capture current display buffer index (cheap read)
+        int buf = display_buf;
         for (int row = 0; row < SCAN; ++row) {
             set_pin(MASK_A, row & 1);
             set_pin(MASK_B, (row >> 1) & 1);
             set_pin(MASK_C, (row >> 2) & 1);
-            
+
             for (int plane = 0; plane < BITPLANES; ++plane) {
-                for (int col = 0; col < COLUMNS*1; ++col) {
+                // shift out columns
+                for (int col = 0; col < COLUMNS * 1; ++col) {
                     gpio_out_set_levels(bitplane_buf[buf][plane][row][col]);
                     pulse_clk();
-                    if (col == COLUMNS*1 - 4)
-                    {
-						
-						//esp_rom_delay_us(10);
-						set_pin(MASK_OE, 1); // disable outputs while shifting
-						set_pin(MASK_LE, 1);
-					} 
+                    if (col == COLUMNS * 1 - 4) set_pin(MASK_LE, 1);
                 }
-                //for(int i = 0; i < 400000; i++);
                 set_pin(MASK_LE, 0);
 
-                // compute average weighted time for this plane across the row
+                // compute avg for this plane/row (already done in rebuild_all_bitplanes_back,
+                // but we recompute here to keep timing consistent if needed)
                 uint64_t total = 0;
                 for (int col = 0; col < COLUMNS; ++col) {
                     uint8_t p = bitplane_buf[buf][plane][row][col];
@@ -410,24 +818,22 @@ static void refresh_task(void *arg) {
                 uint32_t avg = (uint32_t)(total / (uint64_t)COLUMNS);
                 if (!avg) continue;
 
-                // convert avg units into microseconds using base_unit_us
+                // convert avg units to microseconds
                 uint32_t t_us = avg * base_unit_us;
-                // clamp to reasonable min/max to avoid too-short or too-long pulses
                 if (t_us < 1) t_us = 1;
-                if (t_us > 20000) t_us = 20000; // 20 ms max per plane (prevent lockup)
+                if (t_us > 20000) t_us = 20000;
 
-                // show the plane by enabling outputs
+                // Before enabling outputs for this plane, update registers dynamically.
+                // We call update_regs_dynamic once per row after the last plane's avg is known,
+                // but calling it here is safe because it checks last_reg* and only writes on change.
+                //update_regs_dynamic(buf, row, plane);
+
+                // enable output for the computed time slice
                 set_pin(MASK_OE, 0);
-                esp_rom_delay_us(600);
-                for(int i = 0; i < 70000; i++)
-                {
-			    	__asm__ __volatile__("nop;nop;nop;");
-				}
-                
-                
-                
-                
-                
+                esp_rom_delay_us(25);
+                set_pin(MASK_OE, 1);
+				esp_rom_delay_us(1);
+
             }
         }
     }
@@ -530,33 +936,82 @@ void drawing_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(50));   // allow refresh_task to start
 
     int counter = 0;
-    char buf[25];   // up to "9999" + null
+    char buf[50];   // up to "9999" + null
 
     while (1) {
         // Clear + rebuild back framebuffer
         prepare_frame_back();
 
         // Format counter 0–999
-        sprintf(buf, "%04d", counter);
+        sprintf(buf, "%011d", counter);
 
         // Draw text
-        draw_text_back(6, 4, buf, 255, 0, 0);  // green
+        draw_text_back(2, 1, buf, 255, 0, 0);  // green
 
         // Swap buffers safely
         present_frame_back();
 
         // Increment & wrap
         counter++;
-        if (counter >= 1000) counter = 0;
+        if (counter >= 1234567899) counter = 0;
 
-        vTaskDelay(pdMS_TO_TICKS(250));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
+void reg_test_task(void *arg)
+{
+    (void)arg;
+    printf("Register write test task started\n");
+
+    // initial reset and defaults
+    reset_oen_protocol();
+
+    // write a few different REG1/REG2 values and print them
+    for (int i = 0; i < 5; ++i) {
+        // example REG1 fields: r_up, r_igain, r_v0p3, r_v1p26
+        uint16_t r_up = (uint16_t)(5 + i);         // 0..31
+        uint8_t r_igain = (uint8_t)(0x0F - i);     // 0..15
+        uint8_t r_v0p3 = (uint8_t)((i & 0x07));    // 0..7
+        uint8_t r_v1p26 = (uint8_t)((i * 3) & 0x0F);// 0..15
+
+        write_reg1(r_up, r_igain, r_v0p3, r_v1p26);
+
+        // example REG2 packed value: toggle some bits for test
+        uint16_t reg2 = (uint16_t)((i << 8) | (0xA5 ^ i));
+        write_reg2(reg2);
+
+        printf("Wrote REG1 = 0x%04X (r_up=%u, igain=%u, v0p3=%u, v1p26=%u), REG2 = 0x%04X\n",
+               last_reg1, (unsigned)r_up, (unsigned)r_igain, (unsigned)r_v0p3, (unsigned)r_v1p26, last_reg2);
+
+        // toggle OE to show effect (brief enable)
+        set_pin(PIN_OE,0); // enable outputs (active low)
+        vTaskDelay(pdMS_TO_TICKS(50));
+        set_pin(PIN_OE, 1); // disable outputs
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    // final dump and loop
+    printf("Register test complete. last_reg1=0x%04X last_reg2=0x%04X\n", last_reg1, last_reg2);
+
+    while (1) {
+        // blink PIN_R1 as heartbeat
+        set_pin(PIN_R1, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        set_pin(PIN_R1, 0);
+        vTaskDelay(pdMS_TO_TICKS(800));
+    }
+}
 // -------------------- MAIN --------------------
 void app_main(void)
 {
     init_pins();
+
+    configure_min();     // will write default regs    
+    configure_max();     // will write default regs
+
+
+	start_uart_command_interface();
 
     // initialize mapping: N = panels across, M = panels down
     map_src_to_flat_row_init(&pm, PHYSICAL_PANEL_WIDTH, PHYSICAL_PANEL_HEIGHT, PANELS_ACROSS, PANELS_DOWN);
@@ -574,9 +1029,9 @@ void app_main(void)
     compute_plane_times();
 
     // apply sensible defaults (outdoor starts): you can tune these at runtime with set_color_gains()
-    set_color_gains(10000.0f, 10000.0f, 10000.0f);     // boost red & blue pre-gamma
+    set_color_gains(100.0f, 100.0f, 100.0f);     // boost red & blue pre-gamma
     set_global_brightness(255);            // lower than 255 for indoor; increase for outdoor
-    set_pwm_scales(30000.0f, 30000.0f, 30000.0f);     // per-channel scale units
+    set_pwm_scales(100.0f, 100.0f, 100.0f);     // per-channel scale units
     
     fast_memzero32((void*)row_plane_avg, sizeof(row_plane_avg));
 
@@ -586,10 +1041,146 @@ void app_main(void)
     // start drawing task on core 1
     xTaskCreatePinnedToCore(drawing_task, "drawing_task", 8192, NULL, 1, NULL, 1);
 
+	//xTaskCreatePinnedToCore(reg_test_task, "reg_test", 4096, NULL, 1, NULL, 1);
+
+
     while (1) vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
 
+
+/*
+    // Diagnostic for last panel mapping
+    int last_panel_index = pm.M * pm.N - 1;
+    int panel_start_dx = last_panel_index * pm.panel_w;
+    printf("last panel index=%d start_dx=%d PANEL_W_TOTAL=%d\n", last_panel_index, panel_start_dx, PANEL_W_TOTAL);
+    for (int lx = 0; lx < pm.panel_w; ++lx) {
+        PixelMap p = get_panel_map_coord_fast(0, lx); // test row 0
+        printf("lx=%2d -> p.x=%2d p.y=%2d\n", lx, p.x, p.y);
+    }   
+*/ 
+
+
+
+
+
+/*
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_rom_sys.h"
+#include "soc/gpio_struct.h"
+#include <stdbool.h>
+#include <string.h>
+#include <stdint.h>
+
+#define PIN_R0   GPIO_NUM_2
+#define PIN_G0   GPIO_NUM_4
+#define PIN_B0   GPIO_NUM_5
+#define PIN_R1   GPIO_NUM_18
+#define PIN_G1   GPIO_NUM_19
+#define PIN_B1   GPIO_NUM_25
+#define PIN_CLK  GPIO_NUM_13
+#define PIN_LE   GPIO_NUM_12
+#define PIN_OE   GPIO_NUM_14
+#define PIN_A    GPIO_NUM_15
+#define PIN_B    GPIO_NUM_26
+#define PIN_C    GPIO_NUM_23
+
+#define COLUMNS 80
+#define SCAN     5
+#define PANEL_W 40
+#define PANEL_H 20
+#define BIT_DEPTH 6
+
+typedef struct { uint8_t x; uint8_t y; } PixelMap;
+
+// ==== YOUR ORIGINAL MAP PRESERVED AS-IS ====
+static const PixelMap panel_map[10][40] = {
+  // y = 0
+  {
+    {0,4},{1,4},{2,4},{3,4},{12,4},{13,4},{14,4},{15,4},
+    {16,4},{17,4},{18,4},{19,4},{28,4},{29,4},{30,4},{31,4},
+    {32,4},{33,4},{34,4},{35,4},{44,4},{45,4},{46,4},{47,4},
+    {48,4},{49,4},{50,4},{51,4},{60,4},{61,4},{62,4},{63,4},
+    {64,4},{65,4},{66,4},{67,4},{76,4},{77,4},{78,4},{79,4}
+  },
+  // y = 1
+  {
+    {0,0},{1,0},{2,0},{3,0},{12,0},{13,0},{14,0},{15,0},
+    {16,0},{17,0},{18,0},{19,0},{28,0},{29,0},{30,0},{31,0},
+    {32,0},{33,0},{34,0},{35,0},{44,0},{45,0},{46,0},{47,0},
+    {48,0},{49,0},{50,0},{51,0},{60,0},{61,0},{62,0},{63,0},
+    {64,0},{65,0},{66,0},{67,0},{76,0},{77,0},{78,0},{79,0}
+  },
+  // y = 2
+  {
+    {0,1},{1,1},{2,1},{3,1},{12,1},{13,1},{14,1},{15,1},
+    {16,1},{17,1},{18,1},{19,1},{28,1},{29,1},{30,1},{31,1},
+    {32,1},{33,1},{34,1},{35,1},{44,1},{45,1},{46,1},{47,1},
+    {48,1},{49,1},{50,1},{51,1},{60,1},{61,1},{62,1},{63,1},
+    {64,1},{65,1},{66,1},{67,1},{76,1},{77,1},{78,1},{79,1}
+  },
+  // y = 3
+  {
+    {0,2},{1,2},{2,2},{3,2},{12,2},{13,2},{14,2},{15,2},
+    {16,2},{17,2},{18,2},{19,2},{28,2},{29,2},{30,2},{31,2},
+    {32,2},{33,2},{34,2},{35,2},{44,2},{45,2},{46,2},{47,2},
+    {48,2},{49,2},{50,2},{51,2},{60,2},{61,2},{62,2},{63,2},
+    {64,2},{65,2},{66,2},{67,2},{76,2},{77,2},{78,2},{79,2}
+  },
+  // y = 4
+  {
+    {0,3},{1,3},{2,3},{3,3},{12,3},{13,3},{14,3},{15,3},
+    {16,3},{17,3},{18,3},{19,3},{28,3},{29,3},{30,3},{31,3},
+    {32,3},{33,3},{34,3},{35,3},{44,3},{45,3},{46,3},{47,3},
+    {48,3},{49,3},{50,3},{51,3},{60,3},{61,3},{62,3},{63,3},
+    {64,3},{65,3},{66,3},{67,3},{76,3},{77,3},{78,3},{79,3}
+  },
+  // y = 5
+  {
+    {4,4},{5,4},{6,4},{7,4},{8,4},{9,4},{10,4},{11,4},
+    {20,4},{21,4},{22,4},{23,4},{24,4},{25,4},{26,4},{27,4},
+    {36,4},{37,4},{38,4},{39,4},{40,4},{41,4},{42,4},{43,4},
+    {52,4},{53,4},{54,4},{55,4},{56,4},{57,4},{58,4},{59,4},
+    {68,4},{69,4},{70,4},{71,4},{72,4},{73,4},{74,4},{75,4}
+  },
+  // y = 6
+  {
+    {4,0},{5,0},{6,0},{7,0},{8,0},{9,0},{10,0},{11,0},
+    {20,0},{21,0},{22,0},{23,0},{24,0},{25,0},{26,0},{27,0},
+    {36,0},{37,0},{38,0},{39,0},{40,0},{41,0},{42,0},{43,0},
+    {52,0},{53,0},{54,0},{55,0},{56,0},{57,0},{58,0},{59,0},
+    {68,0},{69,0},{70,0},{71,0},{72,0},{73,0},{74,0},{75,0}
+  },
+  // y = 7
+  {
+    {4,1},{5,1},{6,1},{7,1},{8,1},{9,1},{10,1},{11,1},
+    {20,1},{21,1},{22,1},{23,1},{24,1},{25,1},{26,1},{27,1},
+    {36,1},{37,1},{38,1},{39,1},{40,1},{41,1},{42,1},{43,1},
+    {52,1},{53,1},{54,1},{55,1},{56,1},{57,1},{58,1},{59,1},
+    {68,1},{69,1},{70,1},{71,1},{72,1},{73,1},{74,1},{75,1}
+  },
+  // y = 8
+  {
+    {4,2},{5,2},{6,2},{7,2},{8,2},{9,2},{10,2},{11,2},
+    {20,2},{21,2},{22,2},{23,2},{24,2},{25,2},{26,2},{27,2},
+    {36,2},{37,2},{38,2},{39,2},{40,2},{41,2},{42,2},{43,2},
+    {52,2},{53,2},{54,2},{55,2},{56,2},{57,2},{58,2},{59,2},
+    {68,2},{69,2},{70,2},{71,2},{72,2},{73,2},{74,2},{75,2}
+  },
+  // y = 9
+  {
+    {4,3},{5,3},{6,3},{7,3},{8,3},{9,3},{10,3},{11,3},
+    {20,3},{21,3},{22,3},{23,3},{24,3},{25,3},{26,3},{27,3},
+    {36,3},{37,3},{38,3},{39,3},{40,3},{41,3},{42,3},{43,3},
+    {52,3},{53,3},{54,3},{55,3},{56,3},{57,3},{58,3},{59,3},
+    {68,3},{69,3},{70,3},{71,3},{72,3},{73,3},{74,3},{75,3}
+  }
+};
+
+*/
 
 
 
