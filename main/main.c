@@ -737,6 +737,7 @@ void drawing_task(void *arg)
 
     int counter = 0;
     char buf[50];   // up to "9999" + null
+    char buf2[50];   // up to "9999" + null
 
     while (1) {
         // Clear + rebuild back framebuffer
@@ -744,9 +745,28 @@ void drawing_task(void *arg)
 
         // Format counter 0–999
         sprintf(buf, "%011d", counter);
+        
+        sprintf(buf2, "HELLO WORLD");
 
         // Draw text
-        draw_text_back(2, 9, buf, 255, 255, 255);  // green
+        draw_text_back(2, 10, buf, 255, 255, 255);  // white
+        
+		// increment counter somewhere each frame or tick
+		int idx = counter % 3;
+		
+		switch (idx)
+		{
+		    case 0:
+		        draw_text_back(2, 0, buf2, 255, 0, 0); // red
+		        break;
+		    case 1:
+		        draw_text_back(2, 0, buf2, 0, 255, 0); // green
+		        break;
+		    case 2:
+		        draw_text_back(2, 0, buf2, 0, 0, 255); // blue
+		        break;
+		}
+
 
         // Swap buffers safely
         present_frame_back();
@@ -755,7 +775,7 @@ void drawing_task(void *arg)
         counter++;
         if (counter >= 1234567899) counter = 0;
 
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
