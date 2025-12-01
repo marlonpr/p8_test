@@ -668,28 +668,36 @@ void draw_char_back(int sx, int sy, char c, uint8_t r, uint8_t g, uint8_t b)
 {
     if (c < 32 || c > 126) return;
 
-    // Each glyph is [9][6]
     const uint8_t (*glyph)[6] = font6x9[c - 32];
 
     for (int row = 0; row < 9; row++) {
+
+        int py = sy + row;
+        if (py < 0 || py >= PANEL_H) continue;
+
         for (int col = 0; col < 6; col++) {
+
+            int px = sx + col;
+            if (px < 0 || px >= PANEL_W_TOTAL) continue;   // FIXED
+
             if (glyph[row][col]) {
-                set_pixel_rgb_back(sx + col, sy + row, r, g, b);
+                set_pixel_rgb_back(px, py, r, g, b);
             }
-            // else: background transparent
         }
     }
 }
 
-void draw_text_back(int sx, int sy, const char *str, uint8_t r, uint8_t g, uint8_t b)
+void draw_text_back(int sx, int sy, const char *str,
+                    uint8_t r, uint8_t g, uint8_t b)
 {
     int x = sx;
     while (*str) {
         draw_char_back(x, sy, *str, r, g, b);
-        x += 7;  // 6px glyph + 1px space
+        x += 7;  // 6 px glyph + 1 px space
         str++;
     }
 }
+
 
 /* clear a rectangular region in source coordinates in the back buffer */
 void clear_region_back(int sx, int sy, int w, int h)
@@ -718,6 +726,170 @@ void clear_region_back(int sx, int sy, int w, int h)
     }
 }
 
+
+
+
+// =============================================================
+//  LONG SCROLL SYSTEM (smooth, infinite, no tearing, color-cycle)
+// =============================================================
+
+#define FONT_WIDTH 7           // 6px glyph + 1px spacing
+#define SCROLL_GAP 2           // gap between wrap segments
+#define GAP_CHAR '|'           // special gap char
+#define GAP_PIXELS 2           // pixels added for gap char
+
+// RGB cycle for each new loop of the text
+static const uint8_t SCROLL_COLORS[3][3] = {
+    {255,   0,   0},   // red
+    {  0, 255,   0},   // green
+    {  0,   0, 255}    // blue
+};
+
+typedef struct {
+    char text[128];
+
+    float x;           // current X offset
+    int y;             // vertical position
+
+    int width;         // pixel width of rendered string
+    int loop_width;    // width + scroll gap
+
+    int speed;         // px/sec
+    TickType_t last_tick;
+
+    int next_color;    // color index for new loops
+} scroll_t;
+
+static scroll_t sc = {0};
+
+
+// =============================================================
+//  Compute real pixel width (includes gap chars)
+// =============================================================
+static int scroll_compute_width(const char *s)
+{
+    int w = 0;
+    while (*s)
+    {
+        if (*s == GAP_CHAR)
+            w += GAP_PIXELS;
+        else
+            w += FONT_WIDTH;
+        s++;
+    }
+    return w;
+}
+
+
+// =============================================================
+//  Start scrolling text
+// =============================================================
+void long_scroll_start(const char *txt, int y, int speed_px_sec)
+{
+    strncpy(sc.text, txt, sizeof(sc.text)-1);
+    sc.text[sizeof(sc.text)-1] = '\0';
+
+    sc.y = y;
+    sc.speed = speed_px_sec;
+
+    sc.width = scroll_compute_width(sc.text);
+    sc.loop_width = sc.width + SCROLL_GAP;
+
+    sc.x = 0.0f;
+    sc.last_tick = xTaskGetTickCount();
+
+    // keep previous sc.next_color so colors continue cycling
+}
+
+
+// =============================================================
+//  Helper: get color for a segment
+// =============================================================
+static inline void scroll_get_color(int seg, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    int idx = seg % 3;
+    *r = SCROLL_COLORS[idx][0];
+    *g = SCROLL_COLORS[idx][1];
+    *b = SCROLL_COLORS[idx][2];
+}
+
+
+// =============================================================
+//  Draw text with gap-character support
+// =============================================================
+void draw_text_back_gap(int sx, int sy, const char *str,
+                        uint8_t r, uint8_t g, uint8_t b)
+{
+    int x = sx;
+
+    while (*str)
+    {
+        char c = *str++;
+
+        if (c == GAP_CHAR) {
+            x += GAP_PIXELS;
+            continue;
+        }
+
+        draw_char_back(x, sy, c, r, g, b);
+        x += FONT_WIDTH;
+    }
+}
+
+
+// =============================================================
+//  SCROLL UPDATE — tear-free, smooth, infinite
+// =============================================================
+void long_scroll_update(void)
+{
+    if (sc.loop_width <= 0)
+        return;
+
+    // ----------------------------------------
+    // 1. Smooth movement based on elapsed time
+    // ----------------------------------------
+    TickType_t now = xTaskGetTickCount();
+    TickType_t elapsed_ms = (now - sc.last_tick) * portTICK_PERIOD_MS;
+
+    if (elapsed_ms > 0) {
+        float delta = (sc.speed * elapsed_ms) / 1000.0f;
+        sc.x -= delta;
+        sc.last_tick = now;
+    }
+
+    // ----------------------------------------
+    // 2. Wrap logic — only update base sc.x
+    // ----------------------------------------
+    while (sc.x < -sc.loop_width + FONT_WIDTH) {
+        sc.x += sc.loop_width;
+        sc.next_color++;  // new loop = next color
+    }
+
+    // ----------------------------------------
+    // 3. FRAME-SYNC SNAPSHOT (critical)
+    //    prevents tearing at slow speeds
+    // ----------------------------------------
+    float base_x = sc.x;
+
+    // ----------------------------------------
+    // 4. Draw 3 segments, perfectly aligned
+    // ----------------------------------------
+    for (int i = -1; i <= 1; i++)
+    {
+        float seg_x = base_x + i * sc.loop_width;
+        int seg_index = sc.next_color + i;
+
+        uint8_t r, g, b;
+        scroll_get_color(seg_index, &r, &g, &b);
+
+        draw_text_back_gap((int)seg_x, sc.y, sc.text, r, g, b);
+    }
+}
+
+
+
+
+
 /* -------------------- DRAWING TASK (example counter) -------------------- */
 void drawing_task(void *arg)
 {
@@ -726,6 +898,8 @@ void drawing_task(void *arg)
     int counter = 0;
     char buf[50];   // buffer size used for snprintf
     char buf2[50];
+    long_scroll_start("HELLO|WORLD  ", 0, 10);
+
 
     while (1) {
         // Clear + rebuild back framebuffer
@@ -733,32 +907,29 @@ void drawing_task(void *arg)
 
         // Format counter 0–999 (safely)
         snprintf(buf, sizeof(buf), "%011d", counter);
-        snprintf(buf2, sizeof(buf2), "HELLO WORLD");
+        //snprintf(buf2, sizeof(buf2), "00000000012");
 
         // Draw text
         draw_text_back(2, 10, buf, 255, 255, 255);  // white
+	
 
-        int idx = counter % 3;
-        switch (idx)
-        {
-            case 0:
-                draw_text_back(2, 0, buf2, 255, 0, 0); // red
-                break;
-            case 1:
-                draw_text_back(2, 0, buf2, 0, 255, 0); // green
-                break;
-            case 2:
-                draw_text_back(2, 0, buf2, 0, 0, 255); // blue
-                break;
-        }
+
+		long_scroll_update();
+
+		
+        
+
+        
 
         // Swap buffers safely
         present_frame_back();
 
         // Increment & wrap
         counter++;
-        if (counter >= 1234567899) counter = 0;
-        vTaskDelay(pdMS_TO_TICKS(500));
+        //if (counter >= 1234567899) counter = 0;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        //esp_rom_delay_us(1000);
+
     }
 }
 
@@ -814,3 +985,20 @@ void app_main(void)
 }
 
 
+
+/*
+         int idx = counter % 3;
+        switch (idx)
+        {
+            case 0:
+                draw_text_back(0, 0, buf2, 255, 0, 0); // red
+                break;
+            case 1:
+                draw_text_back(0, 0, buf2, 0, 255, 0); // green
+                break;
+            case 2:
+                draw_text_back(0, 0, buf2, 0, 0, 255); // blue
+                break;
+        }       
+        
+*/       
