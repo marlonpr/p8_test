@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "font6x9.h"
+#include "font3x7.h"
 #include <assert.h>
 #include <stdlib.h>
 
@@ -668,14 +669,14 @@ void draw_char_back(int sx, int sy, char c, uint8_t r, uint8_t g, uint8_t b)
 {
     if (c < 32 || c > 126) return;
 
-    const uint8_t (*glyph)[6] = font6x9[c - 32];
+    const uint8_t (*glyph)[FONT_WIDTH] = font3x7[c - 32];
 
-    for (int row = 0; row < 9; row++) {
+    for (int row = 0; row < FONT_HEIGHT; row++) {
 
         int py = sy + row;
         if (py < 0 || py >= PANEL_H) continue;
 
-        for (int col = 0; col < 6; col++) {
+        for (int col = 0; col < FONT_WIDTH; col++) {
 
             int px = sx + col;
             if (px < 0 || px >= PANEL_W_TOTAL) continue;   // FIXED
@@ -693,7 +694,7 @@ void draw_text_back(int sx, int sy, const char *str,
     int x = sx;
     while (*str) {
         draw_char_back(x, sy, *str, r, g, b);
-        x += 7;  // 6 px glyph + 1 px space
+        x += FONT_WIDTH + 1;  // 6 px glyph + 1 px space
         str++;
     }
 }
@@ -733,7 +734,7 @@ void clear_region_back(int sx, int sy, int w, int h)
 //  LONG SCROLL SYSTEM (smooth, infinite, no tearing, color-cycle)
 // =============================================================
 
-#define FONT_WIDTH 7           // 6px glyph + 1px spacing
+#define SCROLL_WIDTH FONT_WIDTH + 1           // 6px glyph + 1px spacing
 #define SCROLL_GAP 2           // gap between wrap segments
 #define GAP_CHAR '|'           // special gap char
 #define GAP_PIXELS 2           // pixels added for gap char
@@ -774,7 +775,7 @@ static int scroll_compute_width(const char *s)
         if (*s == GAP_CHAR)
             w += GAP_PIXELS;
         else
-            w += FONT_WIDTH;
+            w += SCROLL_WIDTH;
         s++;
     }
     return w;
@@ -832,7 +833,7 @@ void draw_text_back_gap(int sx, int sy, const char *str,
         }
 
         draw_char_back(x, sy, c, r, g, b);
-        x += FONT_WIDTH;
+        x += SCROLL_WIDTH;
     }
 }
 
@@ -860,7 +861,7 @@ void long_scroll_update(void)
     // ----------------------------------------
     // 2. Wrap logic — only update base sc.x
     // ----------------------------------------
-    while (sc.x < -sc.loop_width + FONT_WIDTH) {
+    while (sc.x < -sc.loop_width + 40) {
         sc.x += sc.loop_width;
         sc.next_color++;  // new loop = next color
     }
@@ -906,7 +907,7 @@ void drawing_task(void *arg)
         prepare_frame_back();
 
         // Format counter 0–999 (safely)
-        snprintf(buf, sizeof(buf), "%011d", counter);
+        snprintf(buf, sizeof(buf), "   %012d", counter);
         //snprintf(buf2, sizeof(buf2), "00000000012");
 
         // Draw text
@@ -985,20 +986,4 @@ void app_main(void)
 }
 
 
-
-/*
-         int idx = counter % 3;
-        switch (idx)
-        {
-            case 0:
-                draw_text_back(0, 0, buf2, 255, 0, 0); // red
-                break;
-            case 1:
-                draw_text_back(0, 0, buf2, 0, 255, 0); // green
-                break;
-            case 2:
-                draw_text_back(0, 0, buf2, 0, 0, 255); // blue
-                break;
-        }       
-        
-*/       
+     

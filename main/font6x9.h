@@ -1,8 +1,8 @@
 #pragma once
 #include <stdint.h>
 
-#define FONT_WIDTH  6
-#define FONT_HEIGHT 9
+#define FONT_WIDTH2  6
+#define FONT_HEIGHT2 9
 //#define LINE_HEIGHT 
 static const uint8_t font6x9[95][9][6] = {
   {
